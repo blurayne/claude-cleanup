@@ -1,0 +1,31 @@
+[tasks."install:copy"]
+description = "Install the skill, command and hook into ~/.claude as independent copies"
+run = "{{config_root}}/scripts/install.sh copy"
+
+[tasks."install:symlink"]
+description = "Install into ~/.claude as symlinks back to this repo, so edits here are live"
+run = "{{config_root}}/scripts/install.sh symlink"
+
+[tasks."install:hook"]
+description = "Register only the PreToolUse hook in ~/.claude/settings.json (idempotent)"
+run = "{{config_root}}/scripts/hook.sh install"
+
+[tasks.uninstall]
+description = "Remove the skill, command and hook from ~/.claude (backups are left in place)"
+run = "{{config_root}}/scripts/uninstall.sh"
+
+[tasks.check]
+description = "Report what is installed, whether it matches this repo, and dry-fire the hook"
+run = "{{config_root}}/scripts/check.sh"
+
+[tasks.test]
+description = "Run the functional test against a throwaway /tmp built from fixtures"
+run = "{{config_root}}/scripts/test.sh"
+
+[tasks."hook:status"]
+description = "Show the registered PreToolUse hook entry, if any"
+run = "{{config_root}}/scripts/hook.sh status"
+
+[tasks."clean:dry-run"]
+description = "Show what a /tmp cleanup would remove right now, without deleting anything"
+run = "{{config_root}}/skills/tmp-cleanup-impl.py --dry-run"
