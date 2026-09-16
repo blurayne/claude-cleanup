@@ -15,6 +15,7 @@ On most desktop Linux installs `/tmp` is a tmpfs sized well under the root files
 | `skills/tmp-cleanup-hook.sh` | `~/.claude/skills/` | Debounce fast path, so the hook rarely pays for a Python start |
 | `commands/tmp-cleanup.md` | `~/.claude/commands/` | The `/tmp-cleanup` slash command |
 | `hooks/pretooluse.json` | merged into `~/.claude/settings.json` | The `PreToolUse` hook entry that makes it automatic |
+| `scripts/tmpfiles.sh` | writes `/etc/tmpfiles.d/tmp.conf` or `/etc/periodic.conf` | Tightens the OS's own periodic /tmp cleaner (the only root-level piece) |
 
 ## Install
 
@@ -35,7 +36,23 @@ mise run test        # functional test against a throwaway /tmp built from fixtu
 mise run uninstall   # take it all back out
 ```
 
-`mise run install:hook` and `mise run hook:status` manage just the `settings.json` entry, if you want the files without the automation or vice versa.
+### Every task
+
+| Task | Root? | What it does |
+| --- | --- | --- |
+| `install:copy` | no | Files as independent copies in `~/.claude`, plus the hook |
+| `install:symlink` | no | Same, but symlinked back to this repo so edits go live |
+| `install:hook` | no | Just the `settings.json` entry |
+| `hook:status` | no | Show the registered hook entry, if any |
+| `uninstall` | no | Remove the files and the hook |
+| `install:tmpfiles [days]` | **yes** | Tighten the OS periodic cleaner to 1 day (or the given number) |
+| `uninstall:tmpfiles` | **yes** | Restore the stock OS policy |
+| `tmpfiles:status` | no | Effective OS-level policy, and when its cleaner next runs |
+| `check` | no | What's installed, whether it matches the repo, dry-fire the hook |
+| `test` | no | 25 assertions against throwaway fixtures — deletes nothing real |
+| `clean:dry-run` | no | What a cleanup would remove right now |
+
+`uninstall` deliberately leaves the root-level policy alone; it tells you to run `uninstall:tmpfiles` if one is installed.
 
 ---
 
@@ -88,7 +105,46 @@ An entry directly under `/tmp` is removed only when **every one** of these holds
 | Not the current session's `$TMPDIR` | Don't saw off the branch |
 | Untouched for at least the age floor | mtime, atime *and* ctime, recursively for directories |
 
-The age floor is **30 minutes** for the automatic hook and **60 minutes** for a manual run, overridable with `--min-age`. Directories are judged by the newest timestamp anywhere inside them (bounded at 20,000 entries), so a directory holding one recently-written file is young even if the directory itself is old.
+### The age floor, concretely
+
+The age floor is the single rule people misread, so spelled out:
+
+> **Never delete anything that anything touched in the last N minutes.**
+
+`N` is **30 minutes** for the automatic hook (`TMP_CLEANUP_HOOK_MIN_AGE`, in minutes) and **60 minutes** for a manual run (`--min-age`). The check is one subtraction:
+
+```
+cutoff  = now - N minutes
+touched = the most recent of the entry's mtime, atime and ctime
+          (for a directory: the newest such timestamp of anything inside it)
+
+touched > cutoff  →  KEEP, reason "touched 4m ago"
+touched ≤ cutoff  →  eligible, subject to every other rule
+```
+
+With the hook's default of 30, on a `/tmp` that is running low:
+
+| Entry | `touched` | Outcome |
+| --- | --- | --- |
+| `screenshot.png`, written 4 minutes ago | 4m | **kept** — inside the window |
+| `pw-profile-xyz/`, last written 45 minutes ago | 45m | eligible |
+| `build-scratch/` created 3 days ago, but one file inside written 2 minutes ago | 2m | **kept** — directories inherit the newest timestamp inside them |
+| `old.log`, untouched for a week, but a process has it open | 7d | **kept** — a different rule (open fd) catches it |
+
+So the open-fd check and the age floor cover two different dangers. The fd check stops you deleting something *in use right now*; the age floor stops you deleting something a process finished writing a moment ago and is about to reopen, or that a command which already exited will come back for.
+
+Directory walks are bounded at 20,000 entries — past that the directory keeps whatever newest timestamp was found so far, which errs toward *keeping*.
+
+Setting it:
+
+```bash
+TMP_CLEANUP_HOOK_MIN_AGE=120   # hook only touches things idle for 2 hours
+TMP_CLEANUP_HOOK_MIN_AGE=5     # aggressive; 5 minutes of grace
+TMP_CLEANUP_HOOK_MIN_AGE=0     # no age protection at all — anything not
+                               # currently open is fair game. Not advised.
+```
+
+One automatic override: if the open-file scan could not finish inside its 3-second budget, "not open" is no longer trustworthy, so the floor is raised to **24 hours** regardless of what you set — age becomes the only defence left, so it gets much stronger.
 
 **Protected name patterns**, never removed regardless of age:
 
@@ -106,7 +162,164 @@ So in practice, what *does* get removed is the ordinary debris: stale screenshot
 
 **The desktop trash is never touched automatically.** On a machine where `/tmp` is a tmpfs, deleting a file in a file manager can move it to `/tmp/.Trash-$UID` — which means "deleting" a large file *doesn't free any RAM*, it just relabels it. That is frequently the real reason `/tmp` is full, and the cleaner will tell you so, but emptying it is a decision with user-visible consequences, so it requires an explicit `--trash`.
 
+---
+
+## Why a hook and not a systemd timer
+
+The obvious objection to this design is that periodic cleanup is what cron and systemd timers are *for*, and that paying ~10ms on every tool call to re-implement a scheduler is silly. Mostly that objection is right. Two things keep the hook, and it is worth being precise about which are real constraints and which are merely convenient, because the distinction decides whether a hybrid makes sense.
+
+### Genuinely structural: happens-before
+
+A `PreToolUse` hook is an interposer. Claude Code runs it, waits for it to exit, and only then executes the tool call. Whatever space it frees is guaranteed to be available to *that* write.
+
+A timer has no such relationship to the event. It fires on a clock it chose, against a workload it cannot see. You can narrow the gap — poll every second, watch PSI, subscribe to filesystem events — but you cannot close it, because a process that is not in the call path cannot make its work *happen-before* a write it never observed. The best a service can do is finish cleaning shortly before or shortly after the `ENOSPC`, and which one you get is a race.
+
+This is the same reason a lock is not a sleep.
+
+### Structural only for a service *by itself*: the feedback channel
+
+Here is where my first answer was too strong, so stated plainly: **a service can absolutely deliver feedback into a session — it just cannot do it alone.**
+
+A session's context is writable only by code the session invokes. That is the actual constraint. A hook satisfies it by construction: its stdout is parsed by Claude Code, and `hookSpecificOutput.additionalContext` is injected into the model's context, while `systemMessage` surfaces to you in the terminal. That is how the agent learns
+
+> /tmp was low (884M of 6.0G free). Auto-cleaned 118 stale entries, 135M reclaimed. Still tight — biggest untouchable entries: /tmp/.Trash-1000 1.1G (in use by a running process)…
+
+rather than watching a tool fail with a bare `ENOSPC` and guessing.
+
+A daemon has no such channel. Nothing it writes to disk reaches a running turn unless something *in* that turn reads it. So a service that wants to explain itself needs a hook to carry the message — at which point you have a timer, a unit file, a state file, and a hook, to do what one hook already does. The architecture argument against the service is not "impossible", it is "strictly more moving parts for the same result".
+
+### Not structural at all
+
+Two things I'd previously have filed under this heading don't belong there:
+
+- **Reacting to disk pressure.** A service can poll `statvfs` every second for near-nothing. The hook isn't better at noticing, only at acting in time (see above).
+- **Running with the session's environment.** The `$TMPDIR` protection rule wants the session's `TMPDIR`, which a hook inherits and a user service doesn't. Real, but it's a plumbing detail, not a law — the value could be passed in.
+
+### What follows from this
+
+Split the job by what each mechanism is actually good at:
+
+| Job | Right mechanism | Why |
+| --- | --- | --- |
+| React to pressure *before* a write, and explain it to the agent | this hook | happens-before, plus the only channel into session context |
+| Routine background aging of `/tmp` | `systemd-tmpfiles` | already installed, already scheduled, zero new units |
+
+A custom timer unit would be about eighty lines of unit files to re-solve a solved problem, and on macOS it would need a launchd twin besides. Both platforms already ship the periodic cleaner — see below.
+
+---
+
+## The OS-level cleaner: `mise run install:tmpfiles`
+
+```bash
+mise run tmpfiles:status       # what policy is in effect, and when it next runs
+mise run install:tmpfiles      # tighten it to 1 day (needs root)
+mise run install:tmpfiles 2    # ...or any other number of days
+mise run uninstall:tmpfiles    # put the stock policy back
+```
+
+This is the only part of the repo that needs root, which is why it is a separate task rather than part of `install:copy`. Both directions are idempotent, both back up what they touch, and both refuse to damage configuration that isn't theirs.
+
+### How it works on Linux: `systemd-tmpfiles`
+
+`systemd-tmpfiles` is a declarative janitor for volatile directories. It reads line-oriented rules from three directories, in ascending priority: `/usr/lib/tmpfiles.d/` (vendor), `/run/tmpfiles.d/` (runtime), `/etc/tmpfiles.d/` (yours). Each line is a type letter, a path, mode, owner, group, and an age:
+
+```
+D /tmp 1777 root root 30d
+│ │                   └── delete contents unused for 30 days
+│ └── the path the rule governs
+└── D = create the directory, wipe its contents at boot, and age-clean it
+    (d = the same without the boot wipe; x/X = exclude a path from cleaning)
+```
+
+It runs in two distinct passes, and confusing them is the usual source of surprise:
+
+| Pass | Trigger | What it does |
+| --- | --- | --- |
+| `--create --remove` | `systemd-tmpfiles-setup.service`, at boot | Creates the directories; `D` lines empty them |
+| `--clean` | `systemd-tmpfiles-clean.timer`, **daily** | Deletes entries older than the age field |
+
+"Older than" means the most recent of atime, mtime and ctime — the same rule this cleaner uses, and for the same reason. You can pin it to one timestamp with a prefix (`ctime` only, etc.); see `tmpfiles.d(5)`.
+
+**Overriding is by filename, not by line.** A file in `/etc/tmpfiles.d/` masks the same-named file in `/usr/lib/tmpfiles.d/` entirely. That is why `install:tmpfiles` writes `/etc/tmpfiles.d/tmp.conf` specifically — the vendor file is literally commented *"Clear tmp directories separately, to make them easier to override"*. Dropping a differently-named file like `99-mine.conf` would **not** work: both files would be read, systemd would see two rules for `/tmp`, and it discards the duplicate rather than merging.
+
+The stock policy is useless on a tmpfs:
+
+```
+$ cat /usr/lib/tmpfiles.d/tmp.conf
+D /tmp 1777 root root 30d
+```
+
+Thirty days, on a directory whose entire contents vanish at every reboot. Nothing ever lives long enough for the rule to fire. One day is a far better fit:
+
+```
+# /etc/tmpfiles.d/tmp.conf   ← what install:tmpfiles writes
+D /tmp 1777 root root 1d
+```
+
+Other packages register exclusions for paths that must survive cleaning, and those still apply — `mise run tmpfiles:status` prints them. On this machine:
+
+```
+X /tmp/snap-private-tmp        x /tmp/systemd-private-%b-*
+x /tmp/podman-run-*            x /tmp/containers-user-*
+```
+
+That list is the `systemd-tmpfiles` equivalent of this cleaner's protected-name patterns — which is also the clearest way to see how much cruder it is. **`systemd-tmpfiles` has no open-fd check and no ownership filter.** It deletes on age alone. A directory a process still has open is fair game to it, where this cleaner would skip it. That is fine at a one-day horizon and is why the two mechanisms complement rather than replace each other — don't push the age much below a day.
+
+### How it works on macOS: `periodic(8)`
+
+macOS has no `systemd-tmpfiles`. The equivalent is the BSD `periodic` machinery it inherited from FreeBSD:
+
+- launchd runs `com.apple.periodic-daily` (plus `-weekly`, `-monthly`) from `/System/Library/LaunchDaemons/`.
+- That executes every script in `/etc/periodic/daily/`, of which **`110.clean-tmps`** is the one that cleans `/tmp`.
+- Its behaviour is configured by shell variables, not rule files. Defaults live in `/etc/defaults/periodic.conf` (don't edit that — it's replaced by system updates); overrides go in `/etc/periodic.conf`.
+
+The relevant knobs, which `install:tmpfiles` writes as a marked, removable block:
+
+```sh
+daily_clean_tmps_enable="YES"     # ships as NO — the cleaner is off by default
+daily_clean_tmps_dirs="/tmp"      # which directories to sweep
+daily_clean_tmps_days="1"         # age threshold, in days
+daily_clean_tmps_ignore=".X11-unix .ICE-unix .font-unix .XIM-unix .Trash .Trash-* …"
+daily_clean_tmps_verbose="NO"
+```
+
+Force a run with `sudo periodic daily`, and check `daily_clean_tmps_verbose="YES"` if you want to see what it touched.
+
+Three differences from Linux worth knowing:
+
+- **It is off out of the box.** Where Linux ships a too-lax policy, macOS ships none at all, so enabling it is the whole change.
+- **`/tmp` matters less on a Mac.** It's a symlink to `/private/tmp` on the ordinary APFS root volume, not a tmpfs — so filling it costs disk, not RAM, and there is far more of it. Most Mac temp data goes to the per-user `$TMPDIR` under `/var/folders/…` instead, which `110.clean-tmps` does not touch and this cleaner deliberately protects as the session's own.
+- **`daily_clean_tmps_ignore` is a flat name list**, not the glob-and-type system `tmpfiles.d` offers.
+
+> Everything in this macOS section is written from the documented behaviour of `periodic(8)` and has **not been run on a Mac**. The config-file editing is covered by `mise run test`; whether `periodic` then does the right thing is unverified. Check `mise run tmpfiles:status` and `sudo periodic daily` before trusting it.
+
+## The `/tmp-cleanup` slash command
+
+Typing `/tmp-cleanup` in Claude Code runs the cleaner *with a human in the loop*, which is the difference between it and the hook. The hook acts unilaterally but conservatively; the command can be as aggressive as you like, because you see the list first.
+
+```
+/tmp-cleanup                 # dry-run, show the list, ask, then delete
+/tmp-cleanup --min-age 10    # arguments pass straight through to the script
+/tmp-cleanup --trash         # the one thing the hook will never do on its own
+```
+
+What it does, in order:
+
+1. Loads the `tmp-cleanup` skill, so the model has the safety rules in front of it rather than improvising.
+2. Runs `--dry-run` with whatever arguments you passed.
+3. Shows you the total, the entry count, and — the part that usually matters — the **largest entries it would leave alone, with the reason for each**.
+4. Asks before deleting anything. It skips this only if you explicitly said to just clean it up.
+5. Re-runs for real, then reports free space before and after and points at the audit log.
+
+Two rules it is told to follow: never pass `--trash` unless you asked for it by name, and if the biggest entries are pinned by a running process, say *which* process rather than trying to delete around it.
+
+Unlike the hook, the command is **never debounced**. If a tool just died with `ENOSPC`, use this — don't wait out the five-minute window.
+
+The command is a thin wrapper (`commands/tmp-cleanup.md`); the skill it loads holds the actual guidance, so the two stay in sync by construction.
+
 ## Manual use
+
+Outside Claude Code entirely, the script stands alone:
 
 ```bash
 ~/.claude/skills/tmp-cleanup-impl.py --dry-run     # show what would go
@@ -115,8 +328,6 @@ So in practice, what *does* get removed is the ordinary debris: stale screenshot
 ~/.claude/skills/tmp-cleanup-impl.py --trash       # also empty /tmp/.Trash-*
 ~/.claude/skills/tmp-cleanup-impl.py --json        # machine-readable
 ```
-
-Or `/tmp-cleanup` inside Claude Code, which dry-runs first and asks before deleting.
 
 Both modes finish by listing the **largest entries they left alone, with the reason** — which is usually the actual answer when `/tmp` is full:
 
@@ -141,6 +352,10 @@ All optional, all environment variables:
 | `TMP_CLEANUP_HOOK_MIN_AGE` | `30` | Age floor in minutes for automatic runs |
 | `TMP_CLEANUP_DIR` | `/tmp` | What to clean — the test suite points this at a fixture directory |
 | `CLAUDE_DIR` | `~/.claude` | Honoured by every script here, so the whole install can be exercised against a throwaway directory |
+| `TMP_CLEANUP_TMPFILES_AGE` | `1` | Days, for `install:tmpfiles` when no argument is given |
+| `TMPFILES_TARGET` / `PERIODIC_CONF` / `TMPFILES_PLATFORM` | — | Test seams: retarget or force the platform branch of `tmpfiles.sh` so it can be exercised without root |
+
+Note the units differ by variable: `TMP_CLEANUP_DEBOUNCE` is **seconds**, `TMP_CLEANUP_HOOK_MIN_AGE` is **minutes**, `TMP_CLEANUP_TMPFILES_AGE` is **days**. Each matches the native unit of the mechanism it configures.
 
 ## Requirements
 

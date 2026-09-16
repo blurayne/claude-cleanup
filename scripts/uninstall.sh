@@ -29,4 +29,10 @@ done
 "$REPO/scripts/hook.sh" remove
 
 echo
-echo "The audit log at ~/.cache/claude/tmp-cleanup.log was left in place."
+echo "Left in place on purpose:"
+echo "  ~/.cache/claude/tmp-cleanup.log      audit log"
+echo "  ~/.cache/claude/last-run.timestamp   debounce clock"
+if "$REPO/scripts/tmpfiles.sh" status 2>/dev/null | grep -q ', ours:\|claude-cleanup'; then
+	echo "  the OS-level /tmp aging policy — it needs root:"
+	echo "      mise run uninstall:tmpfiles"
+fi

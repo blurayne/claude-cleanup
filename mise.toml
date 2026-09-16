@@ -10,6 +10,18 @@ run = "{{config_root}}/scripts/install.sh symlink"
 description = "Register only the PreToolUse hook in ~/.claude/settings.json (idempotent)"
 run = "{{config_root}}/scripts/hook.sh install"
 
+[tasks."install:tmpfiles"]
+description = "Tighten the OS's own periodic /tmp cleaner to 1 day (needs root). Pass an age as the first argument, e.g. `mise run install:tmpfiles 2`"
+run = "{{config_root}}/scripts/tmpfiles.sh install"
+
+[tasks."uninstall:tmpfiles"]
+description = "Restore the OS's stock /tmp aging policy (needs root)"
+run = "{{config_root}}/scripts/tmpfiles.sh remove"
+
+[tasks."tmpfiles:status"]
+description = "Show the effective OS-level /tmp aging policy and when its cleaner next runs"
+run = "{{config_root}}/scripts/tmpfiles.sh status"
+
 [tasks.uninstall]
 description = "Remove the skill, command and hook from ~/.claude (backups are left in place)"
 run = "{{config_root}}/scripts/uninstall.sh"

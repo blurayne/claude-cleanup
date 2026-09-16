@@ -36,8 +36,10 @@ head -c 100000 /dev/urandom >"$T/stale-file"
 head -c 1000 /dev/urandom >"$T/open-file"
 python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$T/live.sock"
 
-# Hold a real fd on open-file for the duration of the sweep.
-sleep 30 3<"$T/open-file" &
+# Hold a real fd on open-file for the duration of the sweep. Detach its stdio
+# too: otherwise it inherits our stdout, and `test.sh | tail` blocks until this
+# process exits rather than until the tests finish.
+sleep 30 3<"$T/open-file" >/dev/null 2>&1 &
 SLEEP_PID=$!
 sleep 0.3
 
@@ -111,6 +113,52 @@ TMP_CLEANUP_DEBOUNCE=300 TMP_CLEANUP_DIR="$T" sh "$REPO/skills/tmp-cleanup-hook.
 	bad "wrapper should have short-circuited on a fresh stamp"
 
 export HOME="$HOME_BAK"
+
+# OS-level cleaner config. The targets are overridable, so this exercises the
+# real install/remove code without touching /etc or needing root.
+echo "tmpfiles (Linux branch):"
+CONF="$T/tmp.conf"
+TMPFILES_TARGET="$CONF" "$REPO/scripts/tmpfiles.sh" install 1 >/dev/null
+grep -q '^D /tmp 1777 root root 1d$' "$CONF" && ok "writes the age rule" ||
+	bad "expected a 1d rule in $CONF"
+
+TMPFILES_TARGET="$CONF" "$REPO/scripts/tmpfiles.sh" install 2 >/dev/null
+[[ "$(grep -c '^D /tmp' "$CONF")" == 1 ]] && ok "re-install replaces, never appends" ||
+	bad "re-install left $(grep -c '^D /tmp' "$CONF") rules"
+
+TMPFILES_TARGET="$CONF" "$REPO/scripts/tmpfiles.sh" remove >/dev/null
+[[ ! -f "$CONF" ]] && ok "remove restores the vendor policy" || bad "$CONF still there"
+
+echo 'D /tmp 1777 root root 7d' >"$CONF" # somebody else's config
+TMPFILES_TARGET="$CONF" "$REPO/scripts/tmpfiles.sh" install 1 >/dev/null 2>&1 &&
+	bad "should have refused to clobber a foreign config" ||
+	ok "refuses to clobber a foreign config"
+TMPFILES_TARGET="$CONF" "$REPO/scripts/tmpfiles.sh" remove >/dev/null
+[[ -f "$CONF" ]] && ok "leaves a foreign config alone on remove" ||
+	bad "removed a config that wasn't ours"
+
+echo "tmpfiles (macOS branch):"
+PCONF="$T/periodic.conf"
+printf '# theirs\ndaily_output="/var/log/daily.out"\n' >"$PCONF"
+mac() { TMPFILES_PLATFORM=Darwin PERIODIC_CONF="$PCONF" "$REPO/scripts/tmpfiles.sh" "$@"; }
+
+mac install 1 >/dev/null
+grep -q '^daily_clean_tmps_enable="YES"$' "$PCONF" && ok "enables the stock cleaner" ||
+	bad "periodic.conf not configured"
+
+mac install 3 >/dev/null
+[[ "$(grep -c 'claude-cleanup >>>' "$PCONF")" == 1 ]] && ok "re-install replaces the block" ||
+	bad "duplicate managed blocks"
+grep -q '^daily_clean_tmps_days="3"$' "$PCONF" && ok "re-install applies the new age" ||
+	bad "age not updated"
+
+# Regression: piping the stripped file straight into tee truncated it first,
+# silently destroying every setting the user had.
+mac remove >/dev/null
+grep -q '^daily_output=' "$PCONF" && ok "remove preserves foreign settings" ||
+	bad "remove ate the rest of periodic.conf"
+grep -q 'claude-cleanup' "$PCONF" && bad "block survived removal" ||
+	ok "remove strips the block"
 
 echo
 if [[ "$failures" -eq 0 ]]; then
