@@ -11,7 +11,9 @@ Implementation: `~/.claude/skills/tmp-cleanup-impl.py`. Audit log: `~/.cache/cla
 
 ## Automatic mode
 
-A `PreToolUse` hook runs `tmp-cleanup-impl.py --hook` before `Bash`/`Write`/`Edit` calls. It does one `statvfs()` and returns immediately unless `/tmp` has less than **15% or 512 MiB** free. Only then does it do real work: it deletes stale entries oldest-first until **35%** is free again, and reports what it did as a system message.
+A `PreToolUse` hook runs before `Bash`/`Write`/`Edit` calls, via `tmp-cleanup-hook.sh`. It is **debounced to once every 5 minutes** — inside that window the wrapper exits without even starting Python (~10ms instead of ~120ms). Past the window it does one `statvfs()` and returns immediately unless `/tmp` has less than **15% or 512 MiB** free. Only then does it do real work: it deletes stale entries oldest-first until **35%** is free again, and reports what it did as a system message.
+
+Because of the debounce, `/tmp` can fill up to five minutes before the hook reacts. If a tool just failed with `ENOSPC`, don't wait for it — run the manual mode below, which is never debounced.
 
 The hook is deliberately timid — it never empties the desktop trash, never touches anything under 30 minutes old, and never blocks the tool call (any error exits 0).
 
@@ -34,7 +36,7 @@ An entry directly under `/tmp` is removed only when every one of these holds:
 - owned by the current uid
 - name doesn't match a protected pattern (`.X11-unix`, `.ICE-unix`, `systemd-private-*`, `snap-private-tmp`, `ssh-*`, `gpg-*`, `dbus-*`, `pulse-*`, `tmux-*`, `*.sock`, `*.pid`, `.Trash-*`, …)
 - not a socket or fifo
-- not held open by any visible process — checked against `/proc/*/fd` and `/proc/*/cwd`, so a live Chrome profile or a running build's scratch dir is safe
+- not held open by any visible process — checked against `/proc/*/fd` and `/proc/*/cwd` on Linux, `lsof` on macOS, so a live Chrome profile or a running build's scratch dir is safe
 - not this session's `$TMPDIR`
 - untouched (mtime/atime/ctime, recursively for directories) for at least `--min-age` minutes
 
@@ -50,6 +52,8 @@ Both modes report the **largest entries that were left alone, with the reason**.
 
 ## Tuning
 
-Environment variables, all optional: `TMP_CLEANUP_LOW_PCT` (15), `TMP_CLEANUP_LOW_MB` (512), `TMP_CLEANUP_TARGET_PCT` (35), `TMP_CLEANUP_HOOK_MIN_AGE` (30 minutes), `TMP_CLEANUP_DIR` (`/tmp`).
+Environment variables, all optional: `TMP_CLEANUP_DEBOUNCE` (300 seconds), `TMP_CLEANUP_LOW_PCT` (15), `TMP_CLEANUP_LOW_MB` (512), `TMP_CLEANUP_TARGET_PCT` (35), `TMP_CLEANUP_HOOK_MIN_AGE` (30 minutes), `TMP_CLEANUP_DIR` (`/tmp`).
+
+Developed and tested on Linux. The macOS paths (`lsof`, BSD `find`/`readlink`, `/tmp` → `/private/tmp`) are written but untested — dry-run first on a Mac.
 
 For disk usage outside `/tmp`, reach for a whole-filesystem analyzer instead — this skill deliberately only looks one level under `/tmp`.

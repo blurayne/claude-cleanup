@@ -3,7 +3,7 @@
   "hooks": [
     {
       "type": "command",
-      "command": "python3 \"$HOME/.claude/skills/tmp-cleanup-impl.py\" --hook 2>/dev/null || true",
+      "command": "sh \"$HOME/.claude/skills/tmp-cleanup-hook.sh\" 2>/dev/null || true",
       "timeout": 20,
       "statusMessage": "Checking /tmp space"
     }

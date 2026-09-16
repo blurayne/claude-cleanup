@@ -11,6 +11,7 @@ CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 TARGETS=(
 	"skills/tmp-cleanup.md"
 	"skills/tmp-cleanup-impl.py"
+	"skills/tmp-cleanup-hook.sh"
 	"commands/tmp-cleanup.md"
 )
 

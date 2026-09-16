@@ -8,9 +8,11 @@ Two modes:
              Report what is eligible and delete it.
 
   * hook     `tmp-cleanup-impl.py --hook`
-             Near-zero cost. Reads the hook payload on stdin (and ignores it),
-             checks free space with one statvfs(), and only does real work when
-             /tmp is running low. Prints a JSON hook result on stdout.
+             Debounced: does nothing at all if it already ran within --debounce
+             seconds (default 300). Otherwise reads the hook payload on stdin
+             (and ignores it), checks free space with one statvfs(), and only
+             does real work when /tmp is running low. Prints a JSON hook result
+             on stdout.
 
 Safety rules — an entry is only ever deleted when ALL of these hold:
 
@@ -35,12 +37,17 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 TMP = Path(os.environ.get("TMP_CLEANUP_DIR", "/tmp"))
 LOG = Path.home() / ".cache" / "claude" / "tmp-cleanup.log"
+# Touched on every hook run; its mtime is the debounce clock. The hook command
+# in settings.json stat()s this too, so a debounced call never even pays for a
+# Python interpreter start (~120ms, on every Bash/Write/Edit call).
+STAMP = Path.home() / ".cache" / "claude" / "last-run.timestamp"
 
 # Trigger a hook-mode cleanup when free space drops below either of these.
 LOW_FREE_PCT = float(os.environ.get("TMP_CLEANUP_LOW_PCT", "15"))
@@ -49,6 +56,9 @@ LOW_FREE_MB = float(os.environ.get("TMP_CLEANUP_LOW_MB", "512"))
 TARGET_FREE_PCT = float(os.environ.get("TMP_CLEANUP_TARGET_PCT", "35"))
 # Hook mode never touches anything younger than this (minutes).
 HOOK_MIN_AGE_MIN = float(os.environ.get("TMP_CLEANUP_HOOK_MIN_AGE", "30"))
+# Hook mode runs at most once per this many seconds. Keep in sync with the
+# shell-side guard in hooks/pretooluse.json, which reads the same env var.
+DEBOUNCE_S = float(os.environ.get("TMP_CLEANUP_DEBOUNCE", "300"))
 
 PROTECTED = [
     ".X*-unix",
@@ -74,7 +84,13 @@ PROTECTED = [
     "*.sock",
     "*.socket",
     "*.pid",
+    # macOS: launchd/CoreServices scratch that looks stale but is load-bearing.
+    "com.apple.*",
+    ".keystone_install_lock*",
+    "powerlog",
+    "*.lock",
     ".Trash-*",  # only removable with --trash, handled separately
+    ".Trash",  # macOS spelling, same rule
 ]
 
 
@@ -92,24 +108,40 @@ def free_space() -> tuple[int, int]:
     return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
 
 
-def open_paths(budget_s: float = 3.0) -> tuple[set[str], bool]:
-    """Top-level TMP entries held open (fd or cwd) by a visible process.
+def _roots() -> list[str]:
+    """TMP as a path prefix, plus its symlink-resolved form.
 
-    Returns (names, complete). A single runaway process can hold six figures of
-    fds, so the walk is time-boxed; `complete=False` means the caller must not
-    trust the set and should fall back to an age floor instead.
+    On macOS /tmp is a symlink to /private/tmp, and lsof reports the resolved
+    path — so an open file under /tmp arrives as /private/tmp/... and would
+    otherwise never match.
     """
+    roots = {str(TMP) + os.sep}
+    try:
+        roots.add(str(TMP.resolve()) + os.sep)
+    except OSError:
+        pass
+    return list(roots)
+
+
+def _top_level(dest: str, roots: list[str]) -> str | None:
+    for root in roots:
+        if dest.startswith(root):
+            # Protect the whole top-level entry, not just the open file.
+            return dest[len(root):].split(os.sep, 1)[0] or None
+    return None
+
+
+def _open_paths_proc(budget_s: float) -> tuple[set[str], bool]:
+    """Linux: read /proc/*/fd and /proc/*/cwd directly."""
     live: set[str] = set()
-    root = str(TMP) + os.sep
+    roots = _roots()
     deadline = time.monotonic() + budget_s
-    complete = True
 
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
             continue
         if time.monotonic() > deadline:
-            complete = False
-            break
+            return live, False
         targets = [proc / "cwd"]
         try:
             targets += list((proc / "fd").iterdir())
@@ -120,15 +152,66 @@ def open_paths(budget_s: float = 3.0) -> tuple[set[str], bool]:
                 dest = os.readlink(link)
             except OSError:
                 continue
-            if dest.startswith(root):
-                # Protect the whole top-level entry, not just the open file.
-                live.add(dest[len(root):].split(os.sep, 1)[0])
-    return live, complete
+            name = _top_level(dest, roots)
+            if name:
+                live.add(name)
+    return live, True
+
+
+def _open_paths_lsof(budget_s: float) -> tuple[set[str], bool]:
+    """macOS/BSD: no /proc, so ask lsof for every open path at once.
+
+    `-F n` is the machine-readable format (one `n<path>` record per file), `-w`
+    silences warnings about unreadable processes, `-n`/`-P` skip DNS and service
+    lookups that would otherwise dominate the runtime.
+    """
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return set(), False  # can't prove anything is closed
+
+    try:
+        proc = subprocess.run(
+            [lsof, "-F", "n", "-w", "-n", "-P"],
+            capture_output=True, text=True, timeout=budget_s,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return set(), False
+
+    live: set[str] = set()
+    roots = _roots()
+    for line in proc.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        name = _top_level(line[1:], roots)
+        if name:
+            live.add(name)
+    # lsof exits non-zero when some processes were unreadable, which is normal
+    # for an unprivileged run; the paths it did report are still valid.
+    return live, True
+
+
+def open_paths(budget_s: float = 3.0) -> tuple[set[str], bool]:
+    """Top-level TMP entries held open (fd or cwd) by a visible process.
+
+    Returns (names, complete). A single runaway process can hold six figures of
+    fds, so the scan is time-boxed; `complete=False` means the caller must not
+    trust the set and should fall back to an age floor instead.
+    """
+    if Path("/proc/self/fd").is_dir():
+        return _open_paths_proc(budget_s)
+    return _open_paths_lsof(budget_s)
+
+
+TRASH_PATTERNS = (".Trash-*", ".Trash")
+
+
+def is_trash(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, p) for p in TRASH_PATTERNS)
 
 
 def protected(name: str, allow_trash: bool) -> bool:
     for pattern in PROTECTED:
-        if pattern == ".Trash-*" and allow_trash:
+        if allow_trash and pattern in TRASH_PATTERNS:
             continue
         if fnmatch.fnmatch(name, pattern):
             return True
@@ -198,7 +281,7 @@ def scan(min_age_min: float, allow_trash: bool) -> tuple[list[dict], list[dict]]
         elif session_tmp and (str(entry) == session_tmp or session_tmp.startswith(str(entry) + "/")):
             reason = "this session's TMPDIR"
         elif protected(name, allow_trash):
-            reason = "desktop trash (needs --trash)" if name.startswith(".Trash-") else "protected name"
+            reason = "desktop trash (needs --trash)" if is_trash(name) else "protected name"
         elif st.st_uid != uid:
             reason = "owned by another user"
         elif stat.S_ISSOCK(st.st_mode) or stat.S_ISFIFO(st.st_mode):
@@ -315,7 +398,31 @@ def run_manual(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_hook() -> int:
+def debounced(window_s: float) -> bool:
+    """True if a hook run happened within window_s. Stamps the clock otherwise.
+
+    Failing to read or write the stamp means we simply don't debounce — the
+    cleanup is worth more than the saved milliseconds.
+    """
+    if window_s <= 0:
+        return False
+    try:
+        if time.time() - STAMP.stat().st_mtime < window_s:
+            return True
+    except OSError:
+        pass
+    try:
+        STAMP.parent.mkdir(parents=True, exist_ok=True)
+        STAMP.touch()
+    except OSError:
+        pass
+    return False
+
+
+def run_hook(window_s: float) -> int:
+    if debounced(window_s):
+        return 0
+
     try:
         sys.stdin.read()
     except Exception:
@@ -363,13 +470,17 @@ def main() -> int:
     ap.add_argument("--trash", action="store_true",
                     help="also empty /tmp/.Trash-* (your desktop trash — destructive)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--debounce", type=float, default=DEBOUNCE_S, metavar="SECONDS",
+                    help=f"hook mode: skip entirely if it already ran this recently "
+                         f"(default {DEBOUNCE_S:g}, 0 disables)")
     args = ap.parse_args()
 
     if not TMP.is_dir():
         print(f"no such directory: {TMP}", file=sys.stderr)
         return 1
 
-    return run_hook() if args.hook else run_manual(args)
+    # A manual run is an explicit request — never debounce it.
+    return run_hook(args.debounce) if args.hook else run_manual(args)
 
 
 if __name__ == "__main__":

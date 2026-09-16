@@ -17,7 +17,9 @@ REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SETTINGS="$CLAUDE_DIR/settings.json"
 ENTRY="$REPO/hooks/pretooluse.json"
-MARKER="tmp-cleanup-impl"
+# Broad enough to also recognise entries written by older versions of this repo,
+# which invoked tmp-cleanup-impl.py directly instead of the wrapper.
+MARKER="tmp-cleanup"
 
 command -v jq >/dev/null || {
 	echo "hook.sh: jq is required" >&2
@@ -48,7 +50,15 @@ install)
 	mkdir -p "$CLAUDE_DIR"
 	[[ -f "$SETTINGS" ]] || echo '{}' >"$SETTINGS"
 	if present; then
-		echo "  hook       already registered in $SETTINGS"
+		# Up to date already, or left over from an older version of this repo?
+		if [[ "$(jq -S "[.hooks.PreToolUse[]? | select($IS_OURS)]" "$SETTINGS")" \
+			== "$(jq -S "[.]" "$ENTRY")" ]]; then
+			echo "  hook       already registered in $SETTINGS"
+			exit 0
+		fi
+		write ".hooks.PreToolUse |= [.[]? | select($IS_OURS | not)] | .hooks.PreToolUse += [\$entry]" \
+			--argjson entry "$(cat "$ENTRY")"
+		echo "  hook       updated in $SETTINGS (backup alongside it)"
 		exit 0
 	fi
 	write '.hooks //= {} | .hooks.PreToolUse //= [] | .hooks.PreToolUse += [$entry]' \

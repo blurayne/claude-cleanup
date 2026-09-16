@@ -9,10 +9,10 @@ CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 rc=0
 
 echo "claude dir: $CLAUDE_DIR"
-for rel in skills/tmp-cleanup.md skills/tmp-cleanup-impl.py commands/tmp-cleanup.md; do
+for rel in skills/tmp-cleanup.md skills/tmp-cleanup-impl.py skills/tmp-cleanup-hook.sh commands/tmp-cleanup.md; do
 	dst="$CLAUDE_DIR/$rel"
 	if [[ -L "$dst" ]]; then
-		echo "  symlink    $rel -> $(readlink -- "$dst")"
+		echo "  symlink    $rel -> $(readlink "$dst")"
 	elif [[ -f "$dst" ]]; then
 		if cmp -s "$REPO/$rel" "$dst"; then
 			echo "  copy       $rel (matches repo)"

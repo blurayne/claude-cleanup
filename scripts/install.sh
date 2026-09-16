@@ -27,6 +27,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 FILES=(
 	"skills/tmp-cleanup.md:skills/tmp-cleanup.md"
 	"skills/tmp-cleanup-impl.py:skills/tmp-cleanup-impl.py"
+	"skills/tmp-cleanup-hook.sh:skills/tmp-cleanup-hook.sh"
 	"commands/tmp-cleanup.md:commands/tmp-cleanup.md"
 )
 
@@ -36,7 +37,7 @@ place() {
 
 	# Already exactly what we want? Say so and move on — installing twice is a
 	# no-op, which is what makes this safe to wire into other tasks.
-	if [[ "$MODE" == symlink && "$(readlink -- "$dst" 2>/dev/null)" == "$src" ]]; then
+	if [[ "$MODE" == symlink && "$(readlink "$dst" 2>/dev/null)" == "$src" ]]; then
 		echo "  unchanged  $dst -> $src"
 		return
 	fi
@@ -58,7 +59,7 @@ place() {
 		cp -- "$src" "$dst"
 		echo "  copied     $dst"
 	fi
-	[[ "$dst" == *.py ]] && chmod +x "$dst"
+	case "$dst" in *.py | *.sh) chmod +x "$dst" ;; esac
 	return 0
 }
 
