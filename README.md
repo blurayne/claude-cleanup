@@ -219,6 +219,68 @@ mise run uninstall:tmpfiles    # put the stock policy back
 
 This is the only part of the repo that needs root, which is why it is a separate task rather than part of `install:copy`. Both directions are idempotent, both back up what they touch, and both refuse to damage configuration that isn't theirs.
 
+### Exactly what it writes
+
+Nothing is generated at run time or hidden behind a template — this is the literal content, and you can produce it yourself without root by pointing the task at a scratch file:
+
+```bash
+TMPFILES_TARGET=/tmp/preview.conf ./scripts/tmpfiles.sh install
+```
+
+**Linux — `/etc/tmpfiles.d/tmp.conf`**, created if absent, six lines, pure ASCII:
+
+```
+# >>> claude-cleanup >>>
+# Masks /usr/lib/tmpfiles.d/tmp.conf by filename (see tmpfiles.d(5)).
+# The vendor policy is 30d, which never fires on a tmpfs: nothing
+# survives a reboot long enough to reach that age.
+# Remove with: mise run uninstall:tmpfiles
+D /tmp 1777 root root 1d
+# <<< claude-cleanup <<<
+```
+
+The single functional line is the last one; everything else is comment. `mise run install:tmpfiles 3` changes exactly one character — `1d` becomes `3d`. The `>>>`/`<<<` markers are what `uninstall:tmpfiles` looks for: a `tmp.conf` without them is somebody else's file, and both install and remove will leave it strictly alone rather than guess.
+
+The effect, via `mise run tmpfiles:status`:
+
+```
+                                     before                        after
+vendor  /usr/lib/tmpfiles.d/tmp.conf  D /tmp 1777 root root 30d    D /tmp 1777 root root 30d
+override /etc/tmpfiles.d/tmp.conf     none, vendor policy applies  D /tmp 1777 root root 1d
+```
+
+The vendor file is never edited — it stays exactly as the distro shipped it. Removing the override restores the old behaviour by deletion alone, which is why `uninstall:tmpfiles` can simply `rm` the file.
+
+**macOS — `/etc/periodic.conf`**, a block *appended* to whatever is already there:
+
+```sh
+# ...your existing file, untouched...
+daily_output="/var/log/daily.out"
+
+# >>> claude-cleanup >>>
+# Enables the stock /etc/periodic/daily/110.clean-tmps, which macOS
+# ships disabled. Defaults live in /etc/defaults/periodic.conf.
+# Remove with: mise run uninstall:tmpfiles
+daily_clean_tmps_enable="YES"
+daily_clean_tmps_dirs="/tmp"
+daily_clean_tmps_days="1"
+daily_clean_tmps_ignore=".X11-unix .ICE-unix .font-unix .XIM-unix .Trash .Trash-* quota.user quota.group"
+daily_clean_tmps_verbose="NO"
+# <<< claude-cleanup <<<
+```
+
+Unlike Linux, this file usually already exists and belongs to you, so the block is fenced by markers and everything outside them is preserved byte for byte. Re-installing replaces the block in place rather than appending a second one; removing strips it and leaves the rest. Both are covered by `mise run test` — including a regression for a bug found writing this, where removal briefly ate the whole file.
+
+Line by line:
+
+| Line | Meaning |
+| --- | --- |
+| `daily_clean_tmps_enable="YES"` | Turns the cleaner on. macOS ships `NO`, so this is the entire change. |
+| `daily_clean_tmps_dirs="/tmp"` | Which directories to sweep. Deliberately not `$TMPDIR` — see the macOS notes below. |
+| `daily_clean_tmps_days="1"` | Age threshold in days. |
+| `daily_clean_tmps_ignore="…"` | Flat list of names never removed. The BSD analogue of this cleaner's protected patterns. |
+| `daily_clean_tmps_verbose="NO"` | Set `YES` to have it report what it deleted into the daily mail/log. |
+
 ### How it works on Linux: `systemd-tmpfiles`
 
 `systemd-tmpfiles` is a declarative janitor for volatile directories. It reads line-oriented rules from three directories, in ascending priority: `/usr/lib/tmpfiles.d/` (vendor), `/run/tmpfiles.d/` (runtime), `/etc/tmpfiles.d/` (yours). Each line is a type letter, a path, mode, owner, group, and an age:

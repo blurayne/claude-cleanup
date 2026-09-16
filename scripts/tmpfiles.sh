@@ -63,7 +63,7 @@ linux_install() {
 	{
 		echo "$BEGIN"
 		echo "# Masks $LINUX_VENDOR by filename (see tmpfiles.d(5))."
-		echo "# The vendor policy is 30d, which never fires on a tmpfs — nothing"
+		echo "# The vendor policy is 30d, which never fires on a tmpfs: nothing"
 		echo "# survives a reboot long enough to reach that age."
 		echo "# Remove with: mise run uninstall:tmpfiles"
 		echo "D /tmp 1777 root root ${AGE}d"
